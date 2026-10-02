@@ -1,3 +1,6 @@
+#define RMW_UXRCE_MAX_INPUT_BUFFER_SIZE 1024
+#define RMW_UXRCE_MAX_TRANSPORT_MTU 512
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <micro_ros_arduino.h>
@@ -33,12 +36,14 @@ void stopMotors();
 void arm_callback(const void * msvin);
 void gripper_subscription_callback(const void * msvin);
 void cmd_vel_callback(const void * msin);
+void handleArmTcpServer();
 
 SemaphoreHandle_t serialMutex;
 
 const char* WIFI_SSID = "DIR-806A-C4FA";
 const char* WIFI_PASS = "0108083659";
 const uint16_t LIDAR_TCP_PORT = 8889;
+const uint16_t ARM_TCP_PORT   = 8890; // TCP Server Port for Robotic Arm trajectory
 
 size_t agent_port = 8888;
 char* agent_ip = (char*)"192.168.1.160"; // Replace with your PC's actual Wi-Fi IP
@@ -63,9 +68,12 @@ char* agent_ip = (char*)"192.168.1.160"; // Replace with your PC's actual Wi-Fi 
 // Hardware Serial Interfaces
 HardwareSerial ArduinoSerial(2); // UART2 for Arduino Uno Arm Controller
 
-// TCP Server for LiDAR Bridge
+// TCP Server for LiDAR Bridge & Arm Control
 WiFiServer lidarServer(LIDAR_TCP_PORT);
 WiFiClient lidarClient;
+
+WiFiServer armServer(ARM_TCP_PORT);
+WiFiClient armClient;
 
 // micro-ROS Core Objects
 rcl_subscription_t cmd_vel_subscriber;
@@ -108,7 +116,7 @@ unsigned long last_encoder_time = 0;
 const int CALC_INTERVAL = 100; // 100 ms (10 Hz)
 
 // JGY-370: 11 PPC * 87 Gear Ratio = 957 Ticks/Rev per channel
-const float TICKS_PER_REV = 957.0;  
+const float TICKS_PER_REV = 717.0;  
 const float WHEEL_DIAMETER = 0.065;  // 65mm diameter
 const float WHEEL_RADIUS = 0.0325;   // 32.5mm radius
 
@@ -123,13 +131,14 @@ struct PIDState {
 PIDState left_pid;
 PIDState right_pid;
 
-float Kp = 31.5022091599042;
-int B_PROPORTIONAL = 46.0736612534039;
+float Kv = 10.9303718369895;
+int Bv = 152.718267291324;
+float Kp = 0.0;
 float Ki = 10.0;  
-float Kd = 0.05;   
+float Kd = 0.0;   
 
 int MIN_PWM = 150; 
-int PWM_MAX = 210;
+int PWM_MAX = 220;
 
 volatile float target_left_rad_s = 0.0;
 volatile float target_right_rad_s = 0.0;
@@ -170,12 +179,12 @@ bool micro_ros_init_materials() {
     "/cmd_vel"
   );
 
-  rclc_subscription_init_default(
-    &arm_subscriber,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
-    "/arm_servo_cmds"
-  );
+  // rclc_subscription_init_default(
+  //   &arm_subscriber,
+  //   &node,
+  //   ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
+  //   "/arm_servo_cmds"
+  // );
 
   rclc_subscription_init_default(
     &gripper_sub,
@@ -189,7 +198,7 @@ bool micro_ros_init_materials() {
   executor = rclc_executor_get_zero_initialized_executor();
   rclc_executor_init(&executor, &support.context, 3, &allocator);
   rclc_executor_add_subscription(&executor, &cmd_vel_subscriber, &cmd_vel_msg, &cmd_vel_callback, ON_NEW_DATA);
-  rclc_executor_add_subscription(&executor, &arm_subscriber, &arm_msg, &arm_callback, ON_NEW_DATA);
+  // rclc_executor_add_subscription(&executor, &arm_subscriber, &arm_msg, &arm_callback, ON_NEW_DATA);
   rclc_executor_add_subscription(&executor, &gripper_sub, &gripper_cmd_msg, &gripper_subscription_callback, ON_NEW_DATA);
 
   rmw_uros_sync_session(1000);
@@ -203,7 +212,7 @@ void micro_ros_destroy_materials() {
 
   rcl_publisher_fini(&joint_state_pub, &node);
   rcl_subscription_fini(&cmd_vel_subscriber, &node);
-  rcl_subscription_fini(&arm_subscriber, &node);
+  // rcl_subscription_fini(&arm_subscriber, &node);
   rcl_subscription_fini(&gripper_sub, &node);
   rclc_executor_fini(&executor);
   
@@ -215,11 +224,11 @@ void micro_ros_destroy_materials() {
 
 int computePID(float target_rad_s, float actual_rad_s, PIDState &pid, float dt_sec, int wheel_no) {
   if (abs(target_rad_s) < 0.05) {
-    pid.integral = 0.0;
     pid.prev_error = 0.0;
     return 0;
   }
 
+  float feed_forward_term = Kv * target_rad_s;
   float error = target_rad_s - actual_rad_s;
   float p_term = Kp * error;
 
@@ -233,12 +242,12 @@ int computePID(float target_rad_s, float actual_rad_s, PIDState &pid, float dt_s
   }
   pid.prev_error = error;
 
-  float total_output = p_term + i_term + d_term;
+  float total_output = feed_forward_term + p_term + i_term + d_term;
 
   int target_sign = (target_rad_s >= 0) ? 1 : -1;
   int unified_output = total_output * target_sign;
 
-  unified_output = constrain(B_PROPORTIONAL + unified_output, MIN_PWM, PWM_MAX);
+  unified_output = constrain(Bv + unified_output, MIN_PWM, PWM_MAX);
 
   return target_sign * unified_output;
 }
@@ -247,7 +256,6 @@ int computePID(float target_rad_s, float actual_rad_s, PIDState &pid, float dt_s
 // QUADRATURE ISR ROUTINES
 // =============================================================================
 void IRAM_ATTR leftEncoderISR() {
-  // Read Channel B to determine true direction
   int valB = digitalRead(LEFT_ENCB_PIN);
   if (valB == LOW) {
     left_wheel_ticks++;
@@ -257,7 +265,6 @@ void IRAM_ATTR leftEncoderISR() {
 }
 
 void IRAM_ATTR rightEncoderISR() {
-  // Read Channel B to determine true direction
   int valB = digitalRead(RIGHT_ENCB_PIN);
   if (valB == LOW) {
     right_wheel_ticks++;
@@ -290,20 +297,14 @@ void calculateWheelVelocities(float &left_rad_s, float &right_rad_s) {
 
     float dt_sec = dt_ms / 1000.0;
 
-    // Calculate signed revolutions directly from directional ticks
     float left_revs = (float)current_left_ticks / TICKS_PER_REV;
     float right_revs = (float)current_right_ticks / TICKS_PER_REV;
 
-    // Direct angular velocity (rad/s) with real direction sign included!
     left_rad_s = (left_revs * 2.0 * PI) / dt_sec;
     right_rad_s = (right_revs * 2.0 * PI) / dt_sec;
 
-    left_rad_s *= -1.0;    //correcting due to pin assignment
-    right_rad_s *= -1.0;    //correcting due to pin assignment
-
-    Serial.print(left_rad_s);
-    Serial.print("\t");
-    Serial.println(right_rad_s);
+    left_rad_s *= -1.0;
+    right_rad_s *= -1.0;
 
     last_encoder_time = now;
   }
@@ -408,22 +409,6 @@ void cmd_vel_callback(const void * msin) {
   float linear = msg->linear.x;   
   float angular = msg->angular.z; 
 
-  // if((abs(linear) > 0.0) && (angular == 0.0)) {
-  //   B_PROPORTIONAL = 120;
-  //   MIN_PWM = 120;
-  //   PWM_MAX = 220;
-  // }
-  // else if((linear == 0.0) && (abs(angular) > 0.0)) {
-  //   B_PROPORTIONAL = 190;
-  //   MIN_PWM = 190;
-  //   PWM_MAX = 255;
-  // }
-  // else if((abs(linear) > 0.0) && (abs(angular) > 0.0)) {
-  //   B_PROPORTIONAL = 130;
-  //   MIN_PWM = 130;
-  //   PWM_MAX = 210;
-  // }
-
   float left_m_s  = linear - (angular * WHEEL_SEPARATION / 2.0);
   float right_m_s = linear + (angular * WHEEL_SEPARATION / 2.0);
 
@@ -435,16 +420,24 @@ void arm_callback(const void * msvin) {
   const std_msgs__msg__Float32MultiArray * msg = (const std_msgs__msg__Float32MultiArray *)msvin;
   if (msg == NULL || msg->data.data == NULL) return;
 
+  static int current_deg[5] = {0, 0, 0, 0, 0};
+  const int MAX_STEP_DEG = 5;
+
   if (msg->data.size >= 5) {
-    if (xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+    if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
       ArduinoSerial.print("<");
       for (size_t i = 0; i < 5; i++) {
-        int deg = (int)(msg->data.data[i] * 180.0 / 3.14159);
-        ArduinoSerial.print(deg);
+        int target_deg = (int)(msg->data.data[i] * 180.0 / 3.14159);        
+        int delta = target_deg - current_deg[i];
+        if (abs(delta) > MAX_STEP_DEG) {
+          target_deg = current_deg[i] + (delta > 0 ? MAX_STEP_DEG : -MAX_STEP_DEG);
+        }
+        current_deg[i] = target_deg;
+
+        ArduinoSerial.print(target_deg);
         if (i < 4) ArduinoSerial.print(",");
       }
-      ArduinoSerial.println(">");
-      
+      ArduinoSerial.println(">");      
       xSemaphoreGive(serialMutex);
     }
   }
@@ -456,12 +449,44 @@ void gripper_subscription_callback(const void * msvin) {
 
   int deg = (int)(msg->data * 180.0 / 3.14159);
 
-  if (xSemaphoreTake(serialMutex, portMAX_DELAY) == pdTRUE) {
+  if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
     ArduinoSerial.print(">");
     ArduinoSerial.print(deg);
     ArduinoSerial.println(">");
-    
     xSemaphoreGive(serialMutex);
+  }
+}
+
+// =============================================================================
+// TCP SERVER HANDLER FOR ARM COMMANDS (PORT 8890)
+// =============================================================================
+int serial_tmp_counter = 0;
+
+void handleArmTcpServer() {
+  // Check for incoming client connection
+  if (armServer.hasClient()) {
+    if (!armClient || !armClient.connected()) {
+      if (armClient) armClient.stop();
+      armClient = armServer.available();
+      Serial.println("Arm TCP Client Connected!");
+    } else {
+      WiFiClient extraClient = armServer.available();
+      extraClient.stop(); // Reject additional clients
+    }
+  }
+
+  // Read line-delimited messages from TCP client
+  if (armClient && armClient.connected() && armClient.available()) {
+    String payload = armClient.readStringUntil('\n');
+    payload.trim();
+
+    if (payload.length() > 0) {
+      if (xSemaphoreTake(serialMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        ArduinoSerial.println(payload); // Forward string directly to Arduino Uno UART
+        Serial.println(serial_tmp_counter++);
+        xSemaphoreGive(serialMutex);
+      }
+    }
   }
 }
 
@@ -470,7 +495,10 @@ volatile float latest_actual_right_rad_s = 0.0;
 
 void microRosTask(void * pvParameters) {
   unsigned long last_pub_time = 0;
-  const unsigned long PUB_INTERVAL = 50; 
+  unsigned long last_ping_time = 0;
+  const unsigned long PUB_INTERVAL = 50;   // 20 Hz publish rate
+  const unsigned long PING_INTERVAL = 2000; // Ping every 2 seconds
+  uint8_t failed_pings = 0;
 
   state = WAITING_AGENT;
 
@@ -487,6 +515,7 @@ void microRosTask(void * pvParameters) {
       case AGENT_AVAILABLE:
         if (micro_ros_init_materials()) {
           state = AGENT_CONNECTED;
+          failed_pings = 0;
           Serial.println("micro-ROS Connected & Synced!");
         } else {
           micro_ros_destroy_materials();
@@ -495,23 +524,33 @@ void microRosTask(void * pvParameters) {
         break;
 
       case AGENT_CONNECTED:
-        if (RMW_RET_OK != rmw_uros_ping_agent(100, 1)) {
-          Serial.println("Agent disconnected! Re-establishing session...");
-          state = AGENT_DISCONNECTED;
-          break;
-        }
+        // Continuous non-blocking spin for ROS sub/pub
+        rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
 
-        rclc_executor_spin_some(&executor, 0);
+        if (millis() - last_ping_time >= PING_INTERVAL) {
+          last_ping_time = millis();
+          if (RMW_RET_OK != rmw_uros_ping_agent(20, 1)) {
+            failed_pings++;
+          } else {
+            failed_pings = 0;
+          }
+
+          if (failed_pings >= 10) {
+            state = AGENT_DISCONNECTED;
+            break;
+          }
+        }
 
         if (millis() - last_pub_time >= PUB_INTERVAL) {
           last_pub_time = millis();
           publishJointStates(latest_actual_left_rad_s, latest_actual_right_rad_s);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(1));
         break;
 
       case AGENT_DISCONNECTED:
+        stopMotors();
         micro_ros_destroy_materials();
         state = WAITING_AGENT;
         break;
@@ -523,7 +562,7 @@ void setup() {
   serialMutex = xSemaphoreCreateMutex();
 
   Serial.begin(115200);
-  ArduinoSerial.begin(9600, SERIAL_8N1, ARDUINO_RX_PIN, ARDUINO_TX_PIN);
+  ArduinoSerial.begin(115200, SERIAL_8N1, ARDUINO_RX_PIN, ARDUINO_TX_PIN);
 
   setupMotors();
   setupEncoders();
@@ -533,6 +572,13 @@ void setup() {
     delay(500);
   }
   Serial.println("Wi-Fi connected successfully");
+  Serial.print("ESP32 IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Start Arm TCP Server on Port 8890
+  armServer.begin();
+  armServer.setNoDelay(true); // Disable Nagle's algorithm for low-latency transmission
+  Serial.println("Arm TCP Server started on port 8890");
 
   set_microros_wifi_transports(
     (char*)WIFI_SSID, 
@@ -541,20 +587,27 @@ void setup() {
     agent_port
   );
 
+  // Disable Wi-Fi power save mode for maximum UDP throughput
+  WiFi.setSleep(false);
+
+  // Pin micro-ROS task to Core 1 (Core 0 handles Wi-Fi stack)
   xTaskCreatePinnedToCore(
     microRosTask,
     "microRosTask",
     10240,
     NULL,
-    4,
+    10,    // Priority 10
     NULL,
-    0
+    1     // Core 1
   );
-    
-  Serial.println("micro-ROS Task started on Core 0.");
+  
+  Serial.println("micro-ROS Task started on Core 1.");
 }
 
 void loop() {
+  // Service incoming TCP socket commands for the arm
+  handleArmTcpServer();
+
   unsigned long current_time = millis();
 
   if (current_time - last_pid_time >= PID_INTERVAL) {
