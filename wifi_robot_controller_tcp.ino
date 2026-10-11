@@ -40,8 +40,8 @@ void handleArmTcpServer();
 
 SemaphoreHandle_t serialMutex;
 
-const char* WIFI_SSID = "DIR-806A-C4FA";
-const char* WIFI_PASS = "0108083659";
+const char* WIFI_SSID = "";
+const char* WIFI_PASS = "";
 const uint16_t LIDAR_TCP_PORT = 8889;
 const uint16_t ARM_TCP_PORT   = 8890; // TCP Server Port for Robotic Arm trajectory
 
