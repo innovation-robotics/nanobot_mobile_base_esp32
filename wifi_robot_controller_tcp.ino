@@ -49,21 +49,22 @@ size_t agent_port = 8888;
 char* agent_ip = (char*)"192.168.1.160"; // Replace with your PC's actual Wi-Fi IP
 
 // Motor Driver Pin Definitions (L298N)
-#define L298N_IN1 14
-#define L298N_IN2 15
-#define L298N_IN3 12
-#define L298N_IN4 13
+#define L298N_IN1 12
+#define L298N_IN2 13
+#define L298N_IN3 14
+#define L298N_IN4 27
 
-// L298N PWM Speed Control Pins
 #define L298N_ENA 2  // Left Motor PWM
 #define L298N_ENB 4  // Right Motor PWM
 
-// One-way LiDAR RX Pin
-#define LIDAR_RX_PIN 16
-#define LIDAR_MOTOR_PWM_PIN 5
+#define ARDUINO_RX_PIN 16
+#define ARDUINO_TX_PIN 17
 
-#define ARDUINO_RX_PIN 18
-#define ARDUINO_TX_PIN 19
+#define RIGHT_ENCA_PIN 22
+#define RIGHT_ENCB_PIN 23
+
+#define LEFT_ENCA_PIN  34
+#define LEFT_ENCB_PIN  25
 
 // Hardware Serial Interfaces
 HardwareSerial ArduinoSerial(2); // UART2 for Arduino Uno Arm Controller
@@ -98,14 +99,6 @@ const int PWM_RES = 8;        // 8-bit resolution (0-255)
 const float WHEEL_SEPARATION = 0.233; // Distance between wheels in meters
 const float MAX_LINEAR_VEL = 0.5;    // Max linear speed (m/s)
 
-// =============================================================================
-// QUADRATURE ENCODER CONFIGURATION (JGY-370)
-// =============================================================================
-#define RIGHT_ENCA_PIN 22
-#define RIGHT_ENCB_PIN 23
-
-#define LEFT_ENCA_PIN  25
-#define LEFT_ENCB_PIN  26
 
 // Volatile variables modified inside Quadrature ISRs
 volatile long left_wheel_ticks = 0;
@@ -303,8 +296,14 @@ void calculateWheelVelocities(float &left_rad_s, float &right_rad_s) {
     left_rad_s = (left_revs * 2.0 * PI) / dt_sec;
     right_rad_s = (right_revs * 2.0 * PI) / dt_sec;
 
-    left_rad_s *= -1.0;
+    left_rad_s *= 1.0;
     right_rad_s *= -1.0;
+
+    // Serial debug output inside calculateWheelVelocities()
+    // Serial.print("Left rad/s: ");
+    // Serial.print(left_rad_s);
+    // Serial.print(" | Right rad/s: ");
+    // Serial.println(right_rad_s);    
 
     last_encoder_time = now;
   }
@@ -624,6 +623,8 @@ void loop() {
 
     setLeftMotor(left_pwm);
     setRightMotor(right_pwm);
+    // setLeftMotor(-210);
+    // setRightMotor(-210);
     
     latest_actual_left_rad_s = actual_left_rad_s;
     latest_actual_right_rad_s = actual_right_rad_s;
